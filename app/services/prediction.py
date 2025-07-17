@@ -1,3 +1,5 @@
+# START OF FILE prediction.py
+
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -17,161 +19,131 @@ class PredictionService:
 
     def prepare_sequence_from_df(
         self, df: pd.DataFrame
-    ) -> Tuple[np.ndarray, list, pd.Timestamp, holidays.HolidayBase]:
+    ) -> Tuple[np.ndarray, list, pd.Timestamp, holidays.HolidayBase, pd.Series]:
         """
-        Engineers features from aggregated DataFrame for LSTM model
+        Engineers features from aggregated DataFrame for LSTM model.
+        This logic now EXACTLY mirrors the training script and handles all categories.
         """
-        logger.info("Engineering features for model...")
+        logger.info("Engineering features for model using vectorized operations...")
 
-        # Get feature names from scaler
-        feature_names = self.feature_scaler.get_feature_names_out()
-
-        # Initialize features DataFrame
-        features = pd.DataFrame(index=df.index, columns=feature_names).fillna(0)
-
-        # Ensure datetime index
         if not isinstance(df.index, pd.DatetimeIndex):
             df.index = pd.to_datetime(df.index)
 
-        # Initialize holidays
+        # --- REPLICATE TRAINING SCRIPT LOGIC ---
+        features = pd.DataFrame(index=df.index)
+        features["Lag_1"] = df["Total_Visits"].shift(1)
+        features["Lag_7"] = df["Total_Visits"].shift(7)
+        features["Rolling_Avg_7"] = df["Total_Visits"].shift(1).rolling(window=7).mean()
+
+        # --- FIX APPLIED HERE ---
+        # Force get_dummies to create columns for ALL possible days and months
+        # to prevent KeyErrors when the data slice is small.
+        day_of_week_categorical = pd.Categorical(
+            df.index.dayofweek, categories=range(7)
+        )
+        day_dummies = pd.get_dummies(day_of_week_categorical, prefix="Day_of_Week")
+        day_dummies.index = df.index
+
+        month_categorical = pd.Categorical(df.index.month, categories=range(1, 13))
+        month_dummies = pd.get_dummies(month_categorical, prefix="Month")
+        month_dummies.index = df.index
+        # --- END OF FIX ---
+
+        features = features.join(day_dummies)
+        features = features.join(month_dummies)
+
+        features["Is_Payday_Period"] = df.index.day.isin(
+            list(range(25, 32)) + list(range(1, 4))
+        ).astype(int)
+
         indonesia_holidays = holidays.Indonesia(
             years=range(df.index.year.min(), df.index.year.max() + 2)
         )
+        features["Is_Holiday"] = df.index.isin(indonesia_holidays).astype(int)
 
-        # Feature engineering for each date
-        for i, date in enumerate(df.index):
-            try:
-                # Lag features
-                lag_1_date = date - timedelta(days=1)
-                lag_7_date = date - timedelta(days=7)
+        holiday_dates = sorted(indonesia_holidays.keys())
+        next_holiday_dates = []
+        for d in df.index.date:
+            future_holidays = [hd for hd in holiday_dates if hd >= d]
+            if future_holidays:
+                next_holiday_dates.append(min(future_holidays))
+            else:
+                next_holiday_dates.append(d + timedelta(days=365))
 
-                # Handle lag features with bounds checking
-                if lag_1_date in df.index:
-                    features.loc[date, "Lag_1"] = df.loc[lag_1_date, "Total_Visits"]
-                else:
-                    features.loc[date, "Lag_1"] = 0
+        features["Days_until_Holiday"] = (
+            pd.to_datetime(next_holiday_dates) - df.index
+        ).days
 
-                if lag_7_date in df.index:
-                    features.loc[date, "Lag_7"] = df.loc[lag_7_date, "Total_Visits"]
-                else:
-                    features.loc[date, "Lag_7"] = 0
+        features_original_index = features.index
+        features = features.dropna()
+        logger.info(
+            f"Dropped {len(features_original_index) - len(features)} rows with NaN values."
+        )
 
-                # Rolling average (7-day window ending the day before)
-                if i >= 1:
-                    window_start = max(0, i - 7)
-                    window_data = df.iloc[window_start:i]["Total_Visits"]
-                    features.loc[date, "Rolling_Avg_7"] = (
-                        window_data.mean() if len(window_data) > 0 else 0
-                    )
-                else:
-                    features.loc[date, "Rolling_Avg_7"] = 0
+        historical_visits = df.loc[features.index, "Total_Visits"]
 
-                # Categorical features
-                features.loc[date, f"Day_of_Week_{date.weekday()}"] = 1
-                features.loc[date, f"Month_{date.month}"] = 1
+        feature_names_from_scaler = self.feature_scaler.get_feature_names_out()
+        features = features[feature_names_from_scaler]
 
-                # Payday period (25-31 and 1-3 of month)
-                features.loc[date, "Is_Payday_Period"] = (
-                    1 if date.day in list(range(25, 32)) + list(range(1, 4)) else 0
-                )
-
-                # Holiday features
-                features.loc[date, "Is_Holiday"] = (
-                    1 if date.date() in indonesia_holidays else 0
-                )
-
-                # Days until next holiday
-                future_holidays = [
-                    hd for hd in indonesia_holidays.keys() if hd >= date.date()
-                ]
-                if future_holidays:
-                    next_holiday = min(future_holidays)
-                    features.loc[date, "Days_until_Holiday"] = (
-                        next_holiday - date.date()
-                    ).days
-                else:
-                    features.loc[date, "Days_until_Holiday"] = 365
-
-            except Exception as e:
-                logger.error(f"Error processing date {date}: {e}")
-                continue
-
-        # Scale features
         try:
             scaled_features = self.feature_scaler.transform(features)
-            logger.info(f"✅ Features engineered: {scaled_features.shape}")
+            logger.info(f"✅ Features engineered and scaled: {scaled_features.shape}")
         except Exception as e:
-            logger.error(f"Error scaling features: {e}")
+            logger.error(
+                f"Error scaling features. Check column order and names. Error: {e}"
+            )
             raise
 
-        last_real_date = df.index.max()
+        initial_sequence = scaled_features[-settings.LOOKBACK_PERIOD :]
+        historical_visits_for_loop = historical_visits[-settings.LOOKBACK_PERIOD :]
+        last_real_date = historical_visits_for_loop.index.max()
 
-        return scaled_features, list(feature_names), last_real_date, indonesia_holidays
+        return (
+            initial_sequence,
+            list(feature_names_from_scaler),
+            last_real_date,
+            indonesia_holidays,
+            historical_visits_for_loop,
+        )
 
     def recursive_forecast(
         self,
         initial_sequence: np.ndarray,
+        historical_visits: pd.Series,
         feature_names: list,
         last_real_date: pd.Timestamp,
         indonesia_holidays: holidays.HolidayBase,
         num_days: int = 90,
     ) -> List[Dict[str, Any]]:
-        """
-        Performs recursive forecasting for specified number of days
-        """
         logger.info(f"Starting {num_days}-day recursive forecast...")
 
-        # Initialize tracking variables
         current_sequence = initial_sequence.copy().tolist()
-
-        # Convert initial sequence back to unscaled visits for lag calculation
-        try:
-            unscaled_history = list(
-                self.total_visits_scaler.inverse_transform(
-                    initial_sequence[:, 0].reshape(-1, 1)
-                ).flatten()
-            )
-        except Exception as e:
-            logger.error(f"Error converting initial sequence: {e}")
-            raise
+        unscaled_history = historical_visits.tolist()
 
         predictions = []
         current_date = last_real_date
 
         for day in range(num_days):
             try:
-                # Prepare input for model (last LOOKBACK_PERIOD days)
                 input_sequence = np.array(
                     current_sequence[-settings.LOOKBACK_PERIOD :]
                 ).reshape(1, settings.LOOKBACK_PERIOD, -1)
 
-                # Make prediction
                 pred_scaled_visits, pred_probs_hours = self.model.predict(
                     input_sequence, verbose=0
                 )
-
-                # Convert back to original scale
                 pred_visits = self.total_visits_scaler.inverse_transform(
                     pred_scaled_visits
                 )[0][0]
 
-                # Apply business logic for weekends/holidays
                 next_date = current_date + timedelta(days=1)
-                is_weekend = next_date.weekday() >= 5
-                is_holiday = next_date.date() in indonesia_holidays
+                pred_visits = max(0, pred_visits)
 
-                if is_weekend or is_holiday:
-                    pred_visits = max(0, np.random.randint(0, 3))
-                else:
-                    pred_visits = max(0, pred_visits)
-
-                # Get top 2 peak hours
                 top_2_indices = np.argsort(pred_probs_hours[0])[-2:]
                 top_2_labels = [
                     settings.HOUR_BINS_LABELS[idx] for idx in sorted(top_2_indices)
                 ]
 
-                # Store prediction
                 predictions.append(
                     {
                         "Date": next_date.strftime("%Y-%m-%d"),
@@ -185,11 +157,9 @@ class PredictionService:
                     }
                 )
 
-                # Update tracking variables
                 current_date = next_date
                 unscaled_history.append(pred_visits)
 
-                # Engineer features for next prediction
                 lag_1 = unscaled_history[-2] if len(unscaled_history) >= 2 else 0
                 lag_7 = unscaled_history[-8] if len(unscaled_history) >= 8 else 0
 
@@ -198,11 +168,8 @@ class PredictionService:
                     if len(unscaled_history) >= 8
                     else unscaled_history[:-1]
                 )
-                rolling_avg_7 = (
-                    np.mean(rolling_window) if len(rolling_window) > 0 else 0
-                )
+                rolling_avg_7 = np.mean(rolling_window) if rolling_window else 0
 
-                # Create new feature vector
                 new_feature_vector = pd.Series(index=feature_names, dtype=float).fillna(
                     0
                 )
@@ -220,27 +187,25 @@ class PredictionService:
                     1 if current_date.date() in indonesia_holidays else 0
                 )
 
-                # Days until next holiday
                 future_holidays = [
                     hd for hd in indonesia_holidays.keys() if hd >= current_date.date()
                 ]
                 if future_holidays:
                     next_holiday = min(future_holidays)
-                    new_feature_vector["Days_until_Holiday"] = (
+                    new_vector_days_until_holiday = (
                         next_holiday - current_date.date()
                     ).days
                 else:
-                    new_feature_vector["Days_until_Holiday"] = 365
+                    new_vector_days_until_holiday = 365
+                new_feature_vector["Days_until_Holiday"] = new_vector_days_until_holiday
 
-                # Scale and add to sequence
                 scaled_new_vector = self.feature_scaler.transform(
-                    new_feature_vector.to_frame().T
+                    new_feature_vector.to_frame().T[feature_names]
                 )
                 current_sequence.append(scaled_new_vector[0])
 
             except Exception as e:
-                logger.error(f"Error in forecast day {day + 1}: {e}")
-                # Add fallback prediction
+                logger.error(f"Error in forecast day {day + 1}: {e}", exc_info=True)
                 predictions.append(
                     {
                         "Date": (current_date + timedelta(days=1)).strftime("%Y-%m-%d"),
@@ -250,6 +215,8 @@ class PredictionService:
                     }
                 )
                 current_date += timedelta(days=1)
+                unscaled_history.append(0)
+                current_sequence.append(np.zeros_like(current_sequence[-1]))
 
         logger.info(f"✅ Forecast complete: {len(predictions)} predictions generated")
         return predictions

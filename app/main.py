@@ -14,6 +14,7 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 # Global variables
 ml_loader = None
@@ -108,10 +109,9 @@ async def get_90_day_prediction():
         logger.info("Starting prediction process...")
 
         # Step 1: Fetch and aggregate data
+        days_to_fetch = settings.LOOKBACK_PERIOD + 7
         logger.info(f"Fetching last {settings.LOOKBACK_PERIOD} days of data...")
-        aggregated_df = db_service.fetch_and_aggregate_data(
-            num_days=settings.LOOKBACK_PERIOD
-        )
+        aggregated_df = db_service.fetch_and_aggregate_data(num_days=days_to_fetch)
 
         if aggregated_df.empty:
             raise HTTPException(
@@ -121,22 +121,28 @@ async def get_90_day_prediction():
         if len(aggregated_df) < settings.LOOKBACK_PERIOD:
             raise HTTPException(
                 status_code=400,
-                detail=f"Insufficient data: Need {settings.LOOKBACK_PERIOD} days, got {len(aggregated_df)} days",
+                detail=f"Insufficient data: Need {days_to_fetch} days, got {len(aggregated_df)} days",
             )
 
         logger.info(f"✅ Data fetched successfully: {len(aggregated_df)} days")
 
         # Step 2: Prepare sequence for model
         logger.info("Preparing feature sequence...")
-        initial_sequence, feature_names, last_real_date, holidays_obj = (
-            prediction_service.prepare_sequence_from_df(aggregated_df)
-        )
+        (
+            initial_sequence,
+            feature_names,
+            last_real_date,
+            holidays_obj,
+            historical_visits,
+        ) = prediction_service.prepare_sequence_from_df(aggregated_df)
         logger.info("✅ Feature sequence prepared")
 
         # Step 3: Generate forecast
         logger.info("Generating 90-day forecast...")
+        # MODIFIED: Pass historical_visits to the forecast function
         forecast = prediction_service.recursive_forecast(
             initial_sequence=initial_sequence,
+            historical_visits=historical_visits,  # Pass the actual visits
             feature_names=feature_names,
             last_real_date=last_real_date,
             indonesia_holidays=holidays_obj,
@@ -175,13 +181,13 @@ async def test_data_fetch():
 
     try:
         # Fetch just 5 days for testing
-        test_df = db_service.fetch_and_aggregate_data(num_days=5)
+        test_df = db_service.fetch_and_aggregate_data(num_days=30)
 
         return DataTestResponse(
             status="success",
             data_shape=test_df.shape,
             columns=list(test_df.columns),
-            sample_data=test_df.head(3).to_dict() if not test_df.empty else None,
+            sample_data=test_df.head(30).to_dict() if not test_df.empty else None,
             date_range={
                 "start": str(test_df.index.min()) if not test_df.empty else None,
                 "end": str(test_df.index.max()) if not test_df.empty else None,
