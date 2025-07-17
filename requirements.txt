@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+python-multipart==0.0.6
+sqlalchemy
+psycopg2-binary
+tensorflow
+scikit-learn
+pandas
+joblib
+holidays
+numpy
+pydantic==2.5.0
