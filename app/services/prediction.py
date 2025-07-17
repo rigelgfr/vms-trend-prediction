@@ -1,8 +1,6 @@
-# START OF FILE prediction.py
-
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import timedelta
 import holidays
 from typing import Tuple, List, Dict, Any
 import logging
@@ -29,15 +27,12 @@ class PredictionService:
         if not isinstance(df.index, pd.DatetimeIndex):
             df.index = pd.to_datetime(df.index)
 
-        # --- REPLICATE TRAINING SCRIPT LOGIC ---
         features = pd.DataFrame(index=df.index)
         features["Lag_1"] = df["Total_Visits"].shift(1)
         features["Lag_7"] = df["Total_Visits"].shift(7)
         features["Rolling_Avg_7"] = df["Total_Visits"].shift(1).rolling(window=7).mean()
 
-        # --- FIX APPLIED HERE ---
-        # Force get_dummies to create columns for ALL possible days and months
-        # to prevent KeyErrors when the data slice is small.
+
         day_of_week_categorical = pd.Categorical(
             df.index.dayofweek, categories=range(7)
         )
@@ -47,7 +42,6 @@ class PredictionService:
         month_categorical = pd.Categorical(df.index.month, categories=range(1, 13))
         month_dummies = pd.get_dummies(month_categorical, prefix="Month")
         month_dummies.index = df.index
-        # --- END OF FIX ---
 
         features = features.join(day_dummies)
         features = features.join(month_dummies)
